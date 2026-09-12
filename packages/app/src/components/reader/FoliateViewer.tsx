@@ -2056,7 +2056,13 @@ export const FoliateViewer = forwardRef<FoliateViewerHandle, FoliateViewerProps>
         getDirection(detail.doc);
 
         // Apply theme styles to loaded document
-        applyDocumentStyles(detail.doc, viewSettings, isFixedLayout, appTheme);
+        applyDocumentStyles(
+          detail.doc,
+          viewSettings,
+          isFixedLayout,
+          appTheme,
+          viewRef.current?.book?.metadata?.language,
+        );
 
         // Register iframe event handlers for this section
         registerIframeEventHandlers(bookKey, detail.doc);
@@ -3185,19 +3191,22 @@ function applyDocumentStyles(
   settings: ViewSettings,
   isFixedLayout: boolean,
   theme: AppTheme,
+  bookLanguage?: string | string[],
 ) {
   if (isFixedLayout) {
     // PDF/CBZ: don't inject styles that would break layout
     return;
   }
 
+  // Section-level lang is the most precise signal; book metadata is the fallback.
+  const language = getDocLanguage(doc) ?? bookLanguage;
   normalizeBrOnlyParagraphs(doc);
   syncRemoteFontStylesInDocument(doc, settings.customFontCssUrls);
   // Unify justify state: tag vertical/fixed roots, unpin (clean undo), then
   // pin author-aligned <br> blocks BEFORE the override stylesheet (which
   // carries the justify fallback) so getComputedStyle sees the book's own CSS.
   syncJustifyForDoc(doc, settings.justifyBodyText !== false);
-  syncReaderOverrideStylesInDocument(doc, getRendererStyles(settings, theme));
+  syncReaderOverrideStylesInDocument(doc, getRendererStyles(settings, theme, language));
 }
 
 function syncReaderOverrideStylesInDocument(doc: Document, css: string) {
@@ -3450,7 +3459,23 @@ function applyReflowLayoutSettings(view: FoliateView, settings: ViewSettings) {
 }
 
 /** Generate CSS string for renderer styles */
-function getRendererStyles(settings: ViewSettings, theme: AppTheme): string {
+/** CJK language detection for typography defaults (widows/orphans conventions) */
+function isCJKLanguage(lang?: string | string[]): boolean {
+  if (!lang) return false;
+  const langs = Array.isArray(lang) ? lang : [lang];
+  return langs.some((l) => /^(zh|ja|ko)\b/i.test(String(l).trim()));
+}
+
+function getDocLanguage(doc: Document): string | undefined {
+  const html = doc.documentElement;
+  return html?.getAttribute("xml:lang") || html?.getAttribute("lang") || undefined;
+}
+
+function getRendererStyles(
+  settings: ViewSettings,
+  theme: AppTheme,
+  bookLanguage?: string | string[],
+): string {
   const colors = getThemeColors(theme);
   const bgColor = colors.bg;
   const fgColor = colors.fg;
@@ -3459,19 +3484,32 @@ function getRendererStyles(settings: ViewSettings, theme: AppTheme): string {
   // Get font theme
   const fontTheme = getFontTheme(settings.fontTheme);
 
-  // Custom font takes precedence over font theme
+  // CJK convention (zh/ja/ko) allows single lines to carry over a page break,
+  // so widows/orphans default to 1 instead of the Western 2.
+  const cjk = isCJKLanguage(bookLanguage);
+
+  // Font themes hold single family names; the fallback chain is built here.
+  // Latin family goes first so a CJK font never captures Latin glyphs, then
+  // the theme's CJK family, then named CJK fallbacks — without them, books
+  // without font CSS (TXT imports, minimal EPUBs) degrade to the browser's
+  // generic Han font regardless of the chosen theme.
+  const quoteName = (name: string) => `'${name.replace(/['"]/g, "").trim()}'`;
+  const cjkFallbacks = (
+    fontTheme.id === "system"
+      ? ["PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC"]
+      : ["Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun"]
+  ).map(quoteName);
   const fontFamily = settings.customFontFamily
     ? JSON.stringify(settings.customFontFamily)
-    : `'${fontTheme.cjk}', '${fontTheme.serif}', serif`;
+    : [quoteName(fontTheme.serif), quoteName(fontTheme.cjk), ...cjkFallbacks, "serif"].join(", ");
 
   // paragraphSpacing is stored as px tuned at the default 16px font size.
-  // Scale it with the actual font size so paragraph gaps stay proportional
-  // at the new 12-64 fontSize range — without this, 16px spacing looks
-  // cramped at fontSize 64. BASELINE matches defaultReadSettings.fontSize
-  // in core/stores/settings-store.ts.
+  // Emit it in em so paragraph gaps track the element's font size across the
+  // 12-64 fontSize range without any fontSize-ratio math. BASELINE matches
+  // defaultReadSettings.fontSize in core/stores/settings-store.ts.
   const BASELINE_FONT_SIZE = 16;
-  const layoutScale = settings.fontSize / BASELINE_FONT_SIZE;
-  const scaledParagraphSpacing = Math.round(settings.paragraphSpacing * layoutScale);
+  const paragraphSpacingEm =
+    Math.round((settings.paragraphSpacing / BASELINE_FONT_SIZE) * 100) / 100;
 
   // When useBookFonts is enabled (default), do not force the reader font onto
   // html/body with !important: the book's own font-family (on html, body, or
@@ -3520,33 +3558,54 @@ html body :is(pre, code, kbd, samp) {
 html {
   --theme-bg-color: ${bgColor};
   --readany-font-family: ${fontFamily};
-  --serif-font: "${fontTheme.serif}";
-  --sans-serif-font: "${fontTheme.sansSerif}";
-  --cjk-font: "${fontTheme.cjk}";
+  --serif-font: ${quoteName(fontTheme.serif)};
+  --sans-serif-font: ${quoteName(fontTheme.sansSerif)};
+  --cjk-font: ${quoteName(fontTheme.cjk)};
 }
 
 html, body {
   background-color: ${bgColor} !important;
   color: ${fgColor} !important;
   font-size: ${settings.fontSize}px !important;
+  line-height: ${settings.lineHeight} !important;
   -webkit-text-size-adjust: none;
   text-size-adjust: none;
+  orphans: ${cjk ? 1 : 2};
+  widows: ${cjk ? 1 : 2};
 }
 
 ${readerFontOverride}
-body :not(#__readany_font_size_override):not(svg):not(svg *):not(math):not(math *):not(pre):not(pre *):not(code):not(code *):not(kbd):not(kbd *):not(samp):not(samp *):not(rt):not(rp) {
-  font-size: ${settings.fontSize}px !important;
+
+/* Typography defaults are zero-specificity: they only fill gaps the publisher
+   left, and any author rule (element, class or inline) beats them. Do NOT
+   raise these to element selectors with !important — that flattens publisher
+   heading scales and CJK margin:0 + text-indent layouts. */
+:where(p, li, blockquote, dd, div) {
+  line-height: ${settings.lineHeight};
 }
 
-/* Line height for text blocks */
-p, div, blockquote, dd, li, span {
-  line-height: ${settings.lineHeight} !important;
+:where(p, li, blockquote, dd) {
+  -webkit-hyphens: auto;
+  hyphens: auto;
+  -webkit-hyphenate-limit-before: 3;
+  -webkit-hyphenate-limit-after: 2;
+  -webkit-hyphenate-limit-lines: 2;
+  hyphenate-limit-chars: 6 3 2;
 }
 
-/* Paragraph spacing */
-p {
-  margin-top: ${scaledParagraphSpacing}px !important;
-  margin-bottom: ${scaledParagraphSpacing}px !important;
+:where(p) {
+  margin-top: ${paragraphSpacingEm}em;
+  margin-bottom: ${paragraphSpacingEm}em;
+}
+${
+  cjk
+    ? `:lang(zh), :lang(ja), :lang(ko) {
+  orphans: 1;
+  widows: 1;
+}
+`
+    : ""
+}
 }
 
 /* Links */
@@ -3626,7 +3685,7 @@ function applyRendererStyles(
     fontSize: settings.fontSize,
     lineHeight: settings.lineHeight,
   });
-  const styles = getRendererStyles(settings, theme);
+  const styles = getRendererStyles(settings, theme, view.book?.metadata?.language);
   // Always unpin first (restores the book's own cascade when justify is
   // disabled), then re-pin author-aligned <br>-containing blocks.
   for (const content of getRendererContents(view)) {
