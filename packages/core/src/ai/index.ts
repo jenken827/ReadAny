@@ -11,6 +11,9 @@ export type { LLMOptions } from "./llm-provider";
 export { processMessages } from "./message-pipeline";
 export type { ProcessedMessage } from "./message-pipeline";
 
+export { dedupeContextBooks, resolveContextBook } from "./context-books";
+export type { ContextBook } from "./context-books";
+
 export { generateSemanticContext, detectOperationType } from "./semantic-context";
 export type { OperationType } from "./semantic-context";
 

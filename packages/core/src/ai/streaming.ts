@@ -6,6 +6,7 @@ import i18n from "i18next";
  */
 import type { AIConfig, Book, SemanticContext, Skill, Thread } from "../types";
 import { streamReadingAgent } from "./agents/reading-agent";
+import type { ContextBook } from "./context-books";
 import { processMessages } from "./message-pipeline";
 import { getToolResultError } from "./tool-result";
 import type { ToolDefinition } from "./tools/tool-types";
@@ -17,14 +18,21 @@ export interface StreamingOptions {
   semanticContext: SemanticContext | null;
   enabledSkills: Skill[];
   isVectorized: boolean;
+  /**
+   * Books the user pinned as conversation context (see the AI chat's context
+   * picker). They are added to the prompt and registered as retrieval sources.
+   */
+  contextBooks?: ContextBook[];
   aiConfig: AIConfig;
   deepThinking?: boolean;
   spoilerFree?: boolean;
   /** Injected tool provider */
   getAvailableTools: (options: {
     bookId: string | null;
+    bookTitle?: string | null;
     isVectorized: boolean;
     enabledSkills: Skill[];
+    contextBooks?: ContextBook[];
   }) => ToolDefinition[];
   onToken: (token: string) => void;
   onComplete: (
@@ -78,6 +86,7 @@ export class StreamingChat {
         semanticContext: options.semanticContext,
         enabledSkills: options.enabledSkills,
         isVectorized: options.isVectorized,
+        contextBooks: options.contextBooks,
         userLanguage: i18n.language || options.book?.meta.language || "en",
         memorySummary: options.thread.memorySummary,
       },
@@ -108,6 +117,7 @@ export class StreamingChat {
           semanticContext: options.semanticContext,
           enabledSkills: options.enabledSkills,
           isVectorized: options.isVectorized,
+          contextBooks: options.contextBooks,
           deepThinking: options.deepThinking,
           spoilerFree: options.spoilerFree,
           memorySummary: options.thread.memorySummary,

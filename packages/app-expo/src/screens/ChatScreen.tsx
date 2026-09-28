@@ -29,6 +29,7 @@ import { useStreamingChat } from "@/hooks";
 import { useResponsiveLayout } from "@/hooks/use-responsive-layout";
 import { resolveActiveAIConfig } from "@/lib/ai/resolve-active-ai-config";
 import { useChatStore } from "@/stores/chat-store";
+import { useLibraryStore } from "@/stores/library-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { getPlatformService } from "@readany/core/services";
 import type { AttachedQuote } from "@readany/core/types";
@@ -40,12 +41,14 @@ import {
   formatRelativeTimeShort,
   getExportFilename,
   getMonthLabel,
+  groupThreadsByBook,
   groupThreadsByTime,
   mergeMessagesWithStreaming,
 } from "@readany/core/utils";
 import * as Clipboard from "expo-clipboard";
 import { Alert } from "react-native";
 
+import { BookPickerSheet } from "@/components/chat/BookPickerSheet";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { ContextPopover } from "@/components/chat/ContextPopover";
 import { MessageList } from "@/components/chat/MessageList";
@@ -169,6 +172,27 @@ export function ChatScreen() {
   }, [initialized, loadAllThreads]);
 
   const generalThreads = getThreadsForContext();
+  const books = useLibraryStore((s) => s.books);
+  const bookGroups = useMemo(() => groupThreadsByBook(threads), [threads]);
+  const [showBookPicker, setShowBookPicker] = useState(false);
+
+  const bookTitleOf = useCallback(
+    (bookId: string) =>
+      books.find((book) => book.id === bookId)?.meta.title ||
+      threads.find((thread) => thread.bookId === bookId && thread.title)?.title ||
+      t("chat.deletedBook", "已删除的书籍"),
+    [books, threads, t],
+  );
+
+  // Book conversations live in the dedicated BookChat screen, so this list is an
+  // entry point: pick a book (with or without existing conversations) to open it.
+  const handleEnterBookChat = useCallback(
+    (bookId: string) => {
+      closeSidebar();
+      navigation.navigate("BookChat", { bookId });
+    },
+    [closeSidebar, navigation],
+  );
 
   // Streaming chat
   const { isStreaming, currentMessage, currentStep, error, sendMessage, stopStream } =
@@ -316,6 +340,64 @@ export function ChatScreen() {
           contentContainerStyle={{ paddingBottom: 20 }}
           showsVerticalScrollIndicator={false}
         >
+          {/* Book conversations — entry point to each book's own chat screen */}
+          <View style={s.sectionHeaderRow}>
+            <Text style={s.sectionLabel}>{t("chat.bookChats", "书籍对话")}</Text>
+            <TouchableOpacity
+              style={s.sectionAction}
+              onPress={() => setShowBookPicker(true)}
+              activeOpacity={0.7}
+            >
+              <BookOpenIcon size={13} color={colors.primary} />
+              <Text style={s.sectionActionText}>{t("chat.selectBook", "选择书籍")}</Text>
+            </TouchableOpacity>
+          </View>
+
+          {bookGroups.length === 0 ? (
+            <View style={s.sidebarEmptyCompact}>
+              <Text style={s.sidebarEmptyText}>{t("chat.noBookThreads", "还没有书籍对话")}</Text>
+            </View>
+          ) : (
+            bookGroups.map((group) => {
+              const latest = group.threads[0];
+              const lastMessage =
+                latest && latest.messages.length > 0
+                  ? latest.messages[latest.messages.length - 1]
+                  : null;
+              const preview = lastMessage?.content?.slice(0, 60) || "";
+              return (
+                <TouchableOpacity
+                  key={group.bookId}
+                  style={s.threadItem}
+                  onPress={() => handleEnterBookChat(group.bookId)}
+                  activeOpacity={0.7}
+                >
+                  <BookOpenIcon size={16} color={colors.mutedForeground} />
+                  <View style={s.threadContent}>
+                    <View style={s.threadTitleRow}>
+                      <Text style={s.threadTitle} numberOfLines={1}>
+                        {bookTitleOf(group.bookId)}
+                      </Text>
+                      <Text style={s.threadTime}>
+                        {t("chat.threadsCount", { count: group.threads.length })}
+                      </Text>
+                      <Text style={s.threadTime}>{formatTime(group.latestUpdatedAt)}</Text>
+                    </View>
+                    {preview ? (
+                      <Text style={s.threadPreview} numberOfLines={1}>
+                        {preview}
+                      </Text>
+                    ) : null}
+                  </View>
+                </TouchableOpacity>
+              );
+            })
+          )}
+
+          <View style={s.sectionHeaderRow}>
+            <Text style={s.sectionLabel}>{t("chat.generalChats", "通用对话")}</Text>
+          </View>
+
           {generalThreads.length === 0 ? (
             <View style={s.sidebarEmpty}>
               <Text style={s.sidebarEmptyText}>{t("chat.noConversations", "暂无对话")}</Text>
@@ -374,13 +456,17 @@ export function ChatScreen() {
       </>
     ),
     [
+      bookGroups,
+      bookTitleOf,
       closeSidebar,
       colors.foreground,
       colors.mutedForeground,
+      colors.primary,
       formatTime,
       generalActiveThreadId,
       generalThreads.length,
       groupedThreads,
+      handleEnterBookChat,
       handleNewThread,
       handleSelectThread,
       removeThread,
@@ -485,6 +571,7 @@ export function ChatScreen() {
                     <EmptyState
                       colors={colors}
                       onSuggestionPress={handleSend}
+                      onOpenBookPicker={() => setShowBookPicker(true)}
                       compact={isTabletLandscape}
                     />
                   </View>
@@ -532,6 +619,13 @@ export function ChatScreen() {
           </Animated.View>
         </View>
       )}
+
+      <BookPickerSheet
+        visible={showBookPicker}
+        books={books}
+        onSelect={handleEnterBookChat}
+        onClose={() => setShowBookPicker(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -539,10 +633,13 @@ export function ChatScreen() {
 function EmptyState({
   colors,
   onSuggestionPress,
+  onOpenBookPicker,
   compact = false,
 }: {
   colors: ThemeColors;
   onSuggestionPress: (text: string, deepThinking: boolean, spoilerFree: boolean) => void;
+  /** Opens the book picker so the user can start a conversation with a book. */
+  onOpenBookPicker?: () => void;
   compact?: boolean;
 }) {
   const { t } = useTranslation();
@@ -582,6 +679,16 @@ function EmptyState({
         <Text style={s.emptySubtitle}>
           {t("chat.askAboutBooks", "关于书籍的任何问题都可以问我")}
         </Text>
+        {onOpenBookPicker && (
+          <TouchableOpacity
+            style={s.bookChatEntry}
+            onPress={onOpenBookPicker}
+            activeOpacity={0.75}
+          >
+            <BookOpenIcon size={16} color={colors.primary} />
+            <Text style={s.bookChatEntryText}>{t("chat.startBookChat", "与某本书对话")}</Text>
+          </TouchableOpacity>
+        )}
       </View>
       <View style={s.suggestionsGrid}>
         {suggestions.map(({ icon, text }) => (
@@ -670,6 +777,23 @@ const makeStyles = (
       fontSize: fs.sm,
       color: colors.mutedForeground,
       textAlign: "center",
+    },
+    bookChatEntry: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      marginTop: 4,
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+      borderRadius: radius.full,
+      borderWidth: 1,
+      borderColor: withOpacity(colors.primary, 0.35),
+      backgroundColor: withOpacity(colors.primary, 0.08),
+    },
+    bookChatEntryText: {
+      fontSize: fs.sm,
+      fontWeight: fw.medium,
+      color: colors.primary,
     },
     suggestionsGrid: {
       flexDirection: "row",
@@ -760,6 +884,28 @@ const makeStyles = (
       color: colors.mutedForeground,
       paddingHorizontal: 10,
       paddingVertical: 4,
+    },
+    sectionHeaderRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingRight: 10,
+    },
+    sectionAction: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 4,
+      paddingHorizontal: 6,
+      paddingVertical: 4,
+    },
+    sectionActionText: {
+      fontSize: 11,
+      color: colors.primary,
+      fontWeight: fw.medium,
+    },
+    sidebarEmptyCompact: {
+      paddingVertical: 12,
+      paddingHorizontal: 10,
     },
     threadItem: {
       flexDirection: "row",

@@ -6,6 +6,7 @@
  */
 import type { Message, SemanticContext, Thread } from "../types";
 import type { Book, Skill } from "../types";
+import type { ContextBook } from "./context-books";
 import { buildSystemPrompt } from "./system-prompt";
 
 interface PipelineConfig {
@@ -20,6 +21,8 @@ interface PipelineContext {
   isVectorized: boolean;
   userLanguage: string;
   memorySummary?: string;
+  /** Books the user pinned as context for this conversation. */
+  contextBooks?: ContextBook[];
 }
 
 export interface ProcessedMessage {
