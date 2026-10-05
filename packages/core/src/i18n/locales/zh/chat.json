@@ -29,6 +29,7 @@
     "askBookPlaceholder": "关于这本书的问题...",
     "askAboutQuote": "关于选中的文本提问...",
     "selectedText": "选中文本",
+    "removeSelectedText": "不再携带选中文本",
     "suggestions": {
       "summarizeReading": "总结我最近的阅读",
       "summarizeBook": "总结这本书",

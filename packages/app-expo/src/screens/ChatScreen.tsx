@@ -680,11 +680,7 @@ function EmptyState({
           {t("chat.askAboutBooks", "关于书籍的任何问题都可以问我")}
         </Text>
         {onOpenBookPicker && (
-          <TouchableOpacity
-            style={s.bookChatEntry}
-            onPress={onOpenBookPicker}
-            activeOpacity={0.75}
-          >
+          <TouchableOpacity style={s.bookChatEntry} onPress={onOpenBookPicker} activeOpacity={0.75}>
             <BookOpenIcon size={16} color={colors.primary} />
             <Text style={s.bookChatEntryText}>{t("chat.startBookChat", "与某本书对话")}</Text>
           </TouchableOpacity>

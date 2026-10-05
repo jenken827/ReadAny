@@ -95,23 +95,35 @@ export function BookChatScreen({ route, navigation }: Props) {
   const { books } = useLibraryStore();
   const book = useMemo(() => books.find((b) => b.id === bookId), [books, bookId]);
 
-  // Initial quote from reader selection
+  // 划词上下文（阅读器选中文本 → 进对话）只服务于「第一问」：
+  // 附着一次、用户可删除、发过一条消息后就不再携带（后续问题靠会话上下文）。
   const [quotes, setQuotes] = useState<AttachedQuote[]>([]);
+  const [selectionContext, setSelectionContext] = useState<string | undefined>(
+    selectedText?.trim() || undefined,
+  );
 
   useEffect(() => {
-    if (selectedText && quotes.length === 0) {
-      setQuotes([
-        {
-          id: `quote-${Date.now()}`,
-          text: selectedText,
-          source: chapterTitle || undefined,
-        },
-      ]);
-    }
-  }, [selectedText, chapterTitle, quotes.length]);
+    const text = selectedText?.trim();
+    if (!text) return;
+    setSelectionContext(text);
+    setQuotes((prev) =>
+      prev.some((quote) => quote.text === text)
+        ? prev
+        : [{ id: `quote-${Date.now()}`, text, source: chapterTitle || undefined }],
+    );
+    // 消费掉导航参数：这样手动删除引用后不会又被补回来，
+    // 再次划词进来时会带上新的 selectedText。
+    navigation.setParams({ selectedText: undefined, chapterTitle: undefined });
+  }, [selectedText, chapterTitle, navigation]);
 
   const handleRemoveQuote = useCallback((id: string) => {
     setQuotes((prev) => prev.filter((q) => q.id !== id));
+  }, []);
+
+  /** 丢弃这次划词上下文（引用 + 顶部对照卡片一起收掉）。 */
+  const clearSelectionContext = useCallback(() => {
+    setQuotes([]);
+    setSelectionContext(undefined);
   }, []);
 
   const threads = useChatStore((s) => s.threads);
@@ -264,6 +276,11 @@ export function BookChatScreen({ route, navigation }: Props) {
         return;
       }
       await sendMessage(text, bookId, deepThinking, spoilerFree, quotes, resolvedAIConfig);
+      // 划词上下文已经随这条消息发出去了，后面接着问不用再重复携带。
+      if (quotes && quotes.length > 0) {
+        setQuotes([]);
+        setSelectionContext(undefined);
+      }
     },
     [bookId, navigation, sendMessage, t],
   );
@@ -534,11 +551,21 @@ export function BookChatScreen({ route, navigation }: Props) {
             enabled={Platform.OS === "android"}
             keyboardVerticalOffset={insets.top}
           >
-            {selectedText?.trim() ? (
+            {selectionContext ? (
               <View style={s.selectionContext} accessibilityLabel="Selected text context">
-                <Text style={s.selectionContextLabel}>{t("chat.selectedText", "选中文本")}</Text>
+                <View style={s.selectionContextHeader}>
+                  <Text style={s.selectionContextLabel}>{t("chat.selectedText", "选中文本")}</Text>
+                  <TouchableOpacity
+                    style={s.selectionContextClose}
+                    onPress={clearSelectionContext}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel={t("chat.removeSelectedText", "不再携带选中文本")}
+                  >
+                    <XIcon size={12} color={colors.mutedForeground} />
+                  </TouchableOpacity>
+                </View>
                 <Text style={s.selectionContextText} numberOfLines={4}>
-                  “{selectedText.trim()}”
+                  “{selectionContext}”
                 </Text>
               </View>
             ) : null}
@@ -688,11 +715,21 @@ const makeStyles = (
       borderLeftColor: colors.primary,
       backgroundColor: withOpacity(colors.muted, 0.72),
     },
+    selectionContextHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 8,
+    },
     selectionContextLabel: {
       fontSize: fs.xs,
       fontWeight: fw.semibold,
       color: colors.primary,
       marginBottom: 3,
+    },
+    selectionContextClose: {
+      marginBottom: 3,
+      padding: 1,
     },
     selectionContextText: {
       fontSize: fs.sm,

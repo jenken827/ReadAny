@@ -29,6 +29,7 @@
     "askBookPlaceholder": "Ask about your book...",
     "askAboutQuote": "Ask about the selected text...",
     "selectedText": "Selected text",
+    "removeSelectedText": "Stop carrying the selected text",
     "suggestions": {
       "summarizeReading": "Summarize my recent reading",
       "summarizeBook": "Summarize this book",
