@@ -35,6 +35,14 @@ interface MessageListProps {
 
 const BOTTOM_THRESHOLD = 80;
 
+/**
+ * Coming back to the bottom re-arms auto-follow — the only position-based way to
+ * do it. Deliberately much tighter than BOTTOM_THRESHOLD: the display threshold
+ * may be generous, the "the user wants to follow again" threshold must not be,
+ * or a slow drag out of the bottom band re-arms while the finger is still moving.
+ */
+const REARM_THRESHOLD = 24;
+
 function sortCitationsByIndex(citations: CitationPart[]): CitationPart[] {
   return citations
     .map((citation, order) => ({ citation, order }))
@@ -59,7 +67,6 @@ export function MessageList({
   const colors = useColors();
   const s = makeStyles(colors);
   const flatListRef = useRef<FlatList>(null);
-  const isAtBottomRef = useRef(true);
   /**
    * Whether the list should keep following the newest message.
    *
@@ -70,9 +77,12 @@ export function MessageList({
    * 6939, i.e. 805px short, with no further event to correct it. Keeping the
    * follow flag on lets the settle check keep pinning until the bottom holds.
    *
-   * Cleared only by a real user drag (onScrollBeginDrag); position-based checks
-   * flip mid-layout while the tail is still growing, which is exactly when we must
-   * keep following. Resumed when the user returns to the bottom or taps 滚动到底部.
+   * This flag is the *user's intent*, not the current position. It goes off the
+   * moment a gesture starts, and comes back only when a gesture ends at the very
+   * bottom (REARM_THRESHOLD) or the user taps 滚动到底部. Position-based re-arming
+   * was the bug behind "上滑又弹回底部": a slow drag spends its first frames
+   * inside BOTTOM_THRESHOLD, so the flag flipped back on mid-drag and the next
+   * measure batch pinned the list back down.
    */
   const autoFollowRef = useRef(true);
   const [showScrollDown, setShowScrollDown] = useState(false);
@@ -83,12 +93,43 @@ export function MessageList({
    */
   const metricsRef = useRef({ off: 0, content: 0, layout: 0 });
 
+  /**
+   * Gesture bookkeeping. A pin must never fight the finger: while a drag or fling
+   * is in flight — and for the frame or two after it settles, because the settle
+   * check lands late — content-size changes are ignored.
+   *
+   * Without this, scrolling up was self-defeating: FlatList measures cells as they
+   * come into view, so an upward drag changes the content height, which fires
+   * onContentSizeChange, which pinned straight back to the bottom.
+   */
+  const draggingRef = useRef(false);
+  const gestureGuardUntilRef = useRef(0);
+  const lastOffsetRef = useRef(0);
+  /** When we last issued a pin — its own correction must not read as a user scroll-up. */
+  const lastPinAtRef = useRef(0);
+
+  /** True while the finger owns the scroll position (drag, fling, or the frame right after). */
+  const isUserInteracting = useCallback(
+    () => draggingRef.current || Date.now() < gestureGuardUntilRef.current,
+    [],
+  );
+
+  /**
+   * Whether the list has reached the bottom once since mount. Until it has, every
+   * pin is issued instantly: opening a thread must land in one step instead of
+   * animating the user through the whole history (and re-animating on every
+   * measure batch, which is what made the entry look janky).
+   */
+  const settledRef = useRef(false);
+
   // Settle-check bookkeeping (offset when the last pin was issued, and how many
   // consecutive pins changed nothing).
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
   const lastPinOffRef = useRef(0);
-  const pinToBottomRef = useRef<(source: string) => void>(() => {});
+  const pinToBottomRef = useRef<
+    (source: string, options?: { animated?: boolean; force?: boolean }) => void
+  >(() => {});
 
   /**
    * A pin can land short: the content size we just saw may not have reached the
@@ -99,89 +140,124 @@ export function MessageList({
    * bottom holds; stop when a pin changes nothing (a list that simply cannot go
    * further must not be hammered — the next content-size change restarts the check).
    */
-  const scheduleSettleCheck = useCallback((source: string, delayMs: number) => {
-    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    retryTimerRef.current = setTimeout(() => {
-      retryTimerRef.current = null;
-      if (!autoFollowRef.current) return;
-      const m = metricsRef.current;
-      const dist = m.content - m.off - m.layout;
-      if (dist <= BOTTOM_THRESHOLD) return;
-      if (Math.abs(m.off - lastPinOffRef.current) < 2) {
-        retryCountRef.current += 1;
-        if (retryCountRef.current >= 4) return;
-      }
-      pinToBottomRef.current(`retry:${source}`);
-    }, delayMs);
-  }, []);
+  const scheduleSettleCheck = useCallback(
+    (source: string, delayMs: number) => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        if (!autoFollowRef.current) return;
+        if (isUserInteracting()) return; // the finger wins over the settle check
+        const m = metricsRef.current;
+        const dist = m.content - m.off - m.layout;
+        if (dist <= BOTTOM_THRESHOLD) {
+          settledRef.current = true;
+          return;
+        }
+        if (Math.abs(m.off - lastPinOffRef.current) < 2) {
+          retryCountRef.current += 1;
+          if (retryCountRef.current >= 4) return;
+        }
+        pinToBottomRef.current(`retry:${source}`);
+      }, delayMs);
+    },
+    [isUserInteracting],
+  );
 
   /**
    * Scroll the list to the newest message.
    *
    * The offset is computed from the content height the native list reported, NOT
    * from VirtualizedList's per-cell estimates (`scrollToEnd`): those estimates fall
-   * short with a tall last message and park the list mid-history. A smooth follow
-   * for short distances keeps streaming readable; long jumps (opening a history)
-   * snap instantly instead of visibly scrolling through the whole conversation.
+   * short with a tall last message and park the list mid-history.
+   *
+   * Animation policy: nothing animates until the list has reached the bottom once
+   * (`settledRef`), so opening a thread is a single instant landing. The previous
+   * `dist <= layout` rule animated every medium-length history through the whole
+   * conversation and re-animated on each measure batch. After the first landing, a
+   * smooth follow for short distances keeps streaming readable while long jumps
+   * stay instant.
+   *
+   * `force` is for explicit user actions (tapping 滚动到底部, sending a message):
+   * they re-arm following themselves and must not be swallowed by the post-gesture
+   * guard. A finger that is still down on the list always wins.
    */
   const pinToBottom = useCallback(
-    (source: string) => {
+    (source: string, options?: { animated?: boolean; force?: boolean }) => {
       const list = flatListRef.current;
       if (!list) return;
+      if (draggingRef.current) return; // never steal the position from a finger
+      if (!options?.force && (!autoFollowRef.current || isUserInteracting())) return;
       const m = metricsRef.current;
       const target = Math.max(0, m.content - m.layout);
       const dist = m.content - m.off - m.layout;
-      if (dist <= 8) return; // already parked at the bottom — don't restart an animation
+      if (dist <= 8) {
+        // already parked at the bottom — don't restart an animation
+        settledRef.current = true;
+        return;
+      }
       lastPinOffRef.current = m.off;
       retryCountRef.current = 0;
-      const animated = dist <= m.layout;
+      const animated = options?.animated ?? (settledRef.current && dist <= m.layout);
+      lastPinAtRef.current = Date.now();
       list.scrollToOffset({ offset: target, animated });
       scheduleSettleCheck(source, animated ? 350 : 130);
     },
-    [scheduleSettleCheck],
+    [isUserInteracting, scheduleSettleCheck],
   );
   pinToBottomRef.current = pinToBottom;
 
   const lastMsg = messages[messages.length - 1];
+  const lastMsgId = lastMsg?.id;
+  const lastMsgRole = lastMsg?.role;
 
-  // Auto-scroll when new messages arrive or parts update
+  // Auto-scroll when new messages arrive or parts update. pinToBottom drops the
+  // call unless the user is still following, so a timer that fires after they
+  // scrolled away is harmless.
   useEffect(() => {
-    if (isAtBottomRef.current && flatListRef.current && messages.length > 0) {
-      setTimeout(() => {
-        pinToBottom("effect:newMessages");
-      }, 100);
-    }
+    if (!flatListRef.current || messages.length === 0) return;
+    const timer = setTimeout(() => pinToBottom("effect:newMessages"), 100);
+    return () => clearTimeout(timer);
   }, [messages.length, pinToBottom]);
 
-  // Periodic scroll during streaming
+  // Periodic scroll during streaming — follow only while the user is following.
   useEffect(() => {
     if (!isStreaming) return;
     const interval = setInterval(() => {
-      if (isAtBottomRef.current) {
-        pinToBottom("effect:streamTick");
-      }
+      pinToBottom("effect:streamTick");
     }, 300);
     return () => clearInterval(interval);
   }, [isStreaming, pinToBottom]);
 
-  // Force scroll to bottom when streaming ends
+  // Settle on the newest message when streaming ends. The old version forced
+  // isAtBottomRef back to true here, which lied about the position and re-armed
+  // the list behind the user's back — the intent gate now lives in pinToBottom.
   useEffect(() => {
-    if (!isStreaming && flatListRef.current && messages.length > 0) {
-      setTimeout(() => {
-        isAtBottomRef.current = true;
-        setShowScrollDown(false);
-        pinToBottom("effect:streamEnd");
-      }, 200);
-    }
+    if (isStreaming || !flatListRef.current || messages.length === 0) return;
+    const timer = setTimeout(() => pinToBottom("effect:streamEnd"), 200);
+    return () => clearTimeout(timer);
   }, [isStreaming, messages.length, pinToBottom]);
+
+  // A freshly sent user message is an explicit "show me the tail": re-arm even if
+  // the user was reading history a moment ago, and land instantly.
+  const prevLastMessageRef = useRef<{ id?: string; role?: string }>({});
+  useEffect(() => {
+    const previous = prevLastMessageRef.current;
+    prevLastMessageRef.current = { id: lastMsgId, role: lastMsgRole };
+    if (!previous.id || previous.id === lastMsgId) return;
+    if (lastMsgRole !== "user") return;
+    autoFollowRef.current = true;
+    setShowScrollDown(false);
+    pinToBottom("effect:sentMessage", { animated: false, force: true });
+  }, [lastMsgId, lastMsgRole, pinToBottom]);
 
   // Listen for keyboard hide events to restore scroll position
   useEffect(() => {
     const keyboardDidHide = Keyboard.addListener(
       Platform.OS === "ios" ? "keyboardDidHide" : "keyboardDidHide",
       () => {
-        // When keyboard hides, ensure we scroll to bottom if we were at bottom
-        if (isAtBottomRef.current && flatListRef.current && messages.length > 0) {
+        // When the keyboard hides the list gets taller; re-pin if we were following
+        // — intent, not position (the position check used to re-arm mid-read).
+        if (flatListRef.current && messages.length > 0) {
           setTimeout(() => {
             pinToBottom("effect:keyboardHide");
           }, 100);
@@ -196,23 +272,49 @@ export function MessageList({
 
   const handleScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-    const nearBottom =
-      contentSize.height - contentOffset.y - layoutMeasurement.height < BOTTOM_THRESHOLD;
-    metricsRef.current = {
-      off: contentOffset.y,
-      content: contentSize.height,
-      layout: layoutMeasurement.height,
-    };
-    if (nearBottom) autoFollowRef.current = true;
-    isAtBottomRef.current = nearBottom;
+    const off = contentOffset.y;
+    const content = contentSize.height;
+    const layout = layoutMeasurement.height;
+    const dist = content - off - layout;
+    const nearBottom = dist < BOTTOM_THRESHOLD;
+    metricsRef.current = { off, content, layout };
+
+    // Direction is the honest signal of intent while the list is still measuring:
+    // an upward move means the user is going for history, so stop following even
+    // if the viewport is still inside the bottom band. Excluded: the settle
+    // correction of a pin we just issued (streaming can replace a part and make
+    // the content shrink, which moves the offset up without the user touching it).
+    const pinJustIssued = Date.now() - lastPinAtRef.current < 400;
+    const movedUp = !pinJustIssued && off < lastOffsetRef.current - 2;
+    lastOffsetRef.current = off;
+
+    if (nearBottom) {
+      settledRef.current = true;
+      // Re-arm at the bottom only, and never while the user is heading away from
+      // it: a slow drag spends its first frames inside BOTTOM_THRESHOLD and used to
+      // re-arm itself right there, which is what rubber-banded the list back down.
+      if (!movedUp && (!draggingRef.current || dist <= 8)) autoFollowRef.current = true;
+    } else if (movedUp || draggingRef.current) {
+      autoFollowRef.current = false;
+    }
+
     setShowScrollDown(!nearBottom && !autoFollowRef.current);
   }, []);
 
+  /** Re-arm following when a gesture ends at the bottom — the only position-based re-arm. */
+  const rearmIfAtBottom = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    if (contentSize.height - contentOffset.y - layoutMeasurement.height > REARM_THRESHOLD) return;
+    autoFollowRef.current = true;
+    settledRef.current = true;
+    setShowScrollDown(false);
+  }, []);
+
   const handleScrollToBottom = useCallback(() => {
-    isAtBottomRef.current = true;
     autoFollowRef.current = true;
     setShowScrollDown(false);
-    pinToBottom("button");
+    // Explicit action: bypass the post-gesture guard, the user asked for the tail.
+    pinToBottom("button", { force: true });
   }, [pinToBottom]);
 
   /** Keep the metrics fresh when a gesture settles (drag or fling). */
@@ -223,6 +325,7 @@ export function MessageList({
       content: contentSize.height,
       layout: layoutMeasurement.height,
     };
+    lastOffsetRef.current = contentOffset.y;
   }, []);
 
   const [selectModalText, setSelectModalText] = useState<string | null>(null);
@@ -267,26 +370,46 @@ export function MessageList({
         contentContainerStyle={s.listContent}
         onScroll={handleScroll}
         onScrollBeginDrag={() => {
-          // Real user drag = they took over the scroll position; stop following
-          // until they come back to the bottom.
+          // The finger takes over: stop following at once, and don't re-arm until
+          // the gesture ends at the very bottom (or 滚动到底部 is tapped).
+          draggingRef.current = true;
+          gestureGuardUntilRef.current = Date.now() + 250;
           autoFollowRef.current = false;
           Keyboard.dismiss();
         }}
-        onScrollEndDrag={trackMetrics}
-        onMomentumScrollEnd={trackMetrics}
+        onScrollEndDrag={(e) => {
+          trackMetrics(e);
+          draggingRef.current = false;
+          // A fling may keep scrolling after the finger lifts; the guard keeps the
+          // content-size changes it triggers from being answered with a pin.
+          gestureGuardUntilRef.current = Date.now() + 250;
+          rearmIfAtBottom(e);
+        }}
+        onMomentumScrollBegin={() => {
+          draggingRef.current = true;
+          gestureGuardUntilRef.current = Date.now() + 250;
+        }}
+        onMomentumScrollEnd={(e) => {
+          trackMetrics(e);
+          draggingRef.current = false;
+          gestureGuardUntilRef.current = Date.now() + 150;
+          rearmIfAtBottom(e);
+        }}
         // Pin to the newest message on EVERY content-size change (each batched
         // render, and each streamed chunk), so a long history lands at the bottom
-        // no matter how many render batches it takes.
+        // no matter how many render batches it takes. pinToBottom skips this while
+        // the user is scrolling: an upward drag measures new cells, which changes
+        // the content height, and pinning on that rubber-banded the list back down.
         onContentSizeChange={(_w, h) => {
           metricsRef.current = { ...metricsRef.current, content: h };
-          if (autoFollowRef.current) pinToBottom("contentSize");
+          pinToBottom("contentSize");
         }}
         // The list's own height can change right after mount (input row / keyboard /
         // tab bar settling); re-pin when that happens, the old offset is then no
         // longer the bottom.
         onLayout={(e) => {
           metricsRef.current = { ...metricsRef.current, layout: e.nativeEvent.layout.height };
-          if (autoFollowRef.current) pinToBottom("listLayout");
+          pinToBottom("listLayout");
         }}
         scrollEventThrottle={16}
         showsVerticalScrollIndicator={false}
