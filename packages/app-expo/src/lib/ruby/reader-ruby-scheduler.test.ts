@@ -54,9 +54,37 @@ describe("mobile reader ruby injection scheduling", () => {
     expect(template).toMatch(/if \(nextMode !== _rubyMode\) \{[\s\S]*?rubyCancelJobs\(\);/);
   });
 
+  it("re-annotates when a preloaded section becomes the visible one", () => {
+    // foliate preloads the neighbouring sections. When such a section later
+    // turns primary the paginator reuses the already-loaded view and only moves
+    // `primaryIndex` — it dispatches no `load`. Hooking injection to `load`
+    // alone therefore misses every section that was preloaded before
+    // annotations were switched on, which is what made reading look "ruby only
+    // in the chapter where it was enabled".
+    expect(template).toMatch(
+      /if \(currentSectionIndex !== previousSectionIndex\) \{[\s\S]*?rubyEnsureForCurrentDoc\(\);/,
+    );
+    expect(template).toMatch(/function rubyEnsureForCurrentDoc\(attempt\) \{/);
+    expect(template).toMatch(/if \(doc\[RUBY_DONE_ATTR\] === mode\) return 0;/);
+    expect(template).toMatch(/job\.doc\[RUBY_DONE_ATTR\] = job\.mode;/);
+    expect(template).toMatch(/delete doc\[RUBY_DONE_ATTR\]/);
+  });
+
+  it("clears annotations on every loaded section, not just the visible one", () => {
+    // Annotations live in each section's DOM and foliate keeps the neighbouring
+    // sections loaded, so cleaning only the visible one leaves already-annotated
+    // sections behind — which then read as "half pinyin, half zhuyin" after a
+    // mode switch.
+    expect(template).toMatch(/if \(_rubyMode\) rubyForEachLoadedDoc\(doRemoveRubyAnnotations\);/);
+    expect(template).toMatch(
+      /if \(rubyForEachLoadedDoc\(doRemoveRubyAnnotations\)\.length\) return;/,
+    );
+  });
+
   it("keeps the generated reader.html in sync with the template", () => {
     expect(built).toContain("var RUBY_SLICE_CHARS = 400;");
     expect(built).toContain("function rubyScheduleInjection(doc, mode) {");
+    expect(built).toContain("function rubyEnsureForCurrentDoc(attempt) {");
     expect(built).toContain("rubyNoteUserActivity(); // 翻页/滚动优先，注音队列让路");
     expect(built).not.toContain("doInjectRubyAnnotations");
   });
