@@ -128,7 +128,15 @@ export function BookChatScreen({ route, navigation }: Props) {
 
   const threads = useChatStore((s) => s.threads);
   const loadThreads = useChatStore((s) => s.loadThreads);
-  const getActiveThreadId = useChatStore((s) => s.getActiveThreadId);
+  /**
+   * 订阅 `bookActiveThreadIds`，不要在渲染里调 `getActiveThreadId()`：
+   * 那是 zustand 的 action，按需读一次状态、不建立订阅。首次打开某本书的对话时
+   * 本地还没有 active id，它要等 `loadThreads` 落地后由下面的 effect 补写；
+   * 若只订阅 `threads`，那次写入不改变 `threads` 引用，不会触发重渲染 ——
+   * 界面就一直停在「AI 助手 / 建议问题」空状态，直到别的交互（点历史图标之类）
+   * 顺带重渲染一次才把消息显示出来。
+   */
+  const bookActiveThreadIds = useChatStore((s) => s.bookActiveThreadIds);
   const setBookActiveThread = useChatStore((s) => s.setBookActiveThread);
   const createThread = useChatStore((s) => s.createThread);
   const removeThread = useChatStore((s) => s.removeThread);
@@ -138,18 +146,22 @@ export function BookChatScreen({ route, navigation }: Props) {
     loadThreads(bookId);
   }, [bookId, loadThreads]);
 
-  const activeThreadId = getActiveThreadId(bookId);
+  const storedActiveThreadId = bookActiveThreadIds[bookId] || null;
+  const bookThreads = getThreadsForContext(bookId);
+  /**
+   * 还没选定会话时先展示列表里最新的一条：它和 `threads` 出现在同一次渲染里，
+   * 所以不会先闪一下空状态、也不用等 effect 补写 id 再重渲染。
+   */
+  const activeThreadId = storedActiveThreadId ?? bookThreads[0]?.id ?? null;
   const activeThread = useMemo(
     () => (activeThreadId ? threads.find((t) => t.id === activeThreadId) : null),
     [threads, activeThreadId],
   );
-  const bookThreads = getThreadsForContext(bookId);
-  const firstBookThreadId = bookThreads[0]?.id;
   useEffect(() => {
-    if (!activeThreadId && firstBookThreadId) {
-      setBookActiveThread(bookId, firstBookThreadId);
+    if (!storedActiveThreadId && activeThreadId) {
+      setBookActiveThread(bookId, activeThreadId);
     }
-  }, [activeThreadId, bookId, firstBookThreadId, setBookActiveThread]);
+  }, [activeThreadId, bookId, storedActiveThreadId, setBookActiveThread]);
 
   const groupedThreads = useMemo(() => {
     const grouped = groupThreadsByTime(bookThreads);

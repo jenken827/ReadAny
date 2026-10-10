@@ -49,7 +49,11 @@ export function ChatPanel({ book, onNavigateToCitation }: ChatPanelProps) {
   const createThread = useChatStore((s) => s.createThread);
   const removeThread = useChatStore((s) => s.removeThread);
   const setBookActiveThread = useChatStore((s) => s.setBookActiveThread);
-  const getActiveThreadId = useChatStore((s) => s.getActiveThreadId);
+  // Subscribe to the active-thread map instead of calling the `getActiveThreadId`
+  // action during render: actions read state imperatively and establish no
+  // subscription, so the id written by the effect below (after the threads land)
+  // would not re-render this panel and the messages would stay hidden.
+  const bookActiveThreadIds = useChatStore((s) => s.bookActiveThreadIds);
   const getThreadsForContext = useChatStore((s) => s.getThreadsForContext);
 
   // Use streaming chat hook with book context
@@ -65,16 +69,19 @@ export function ChatPanel({ book, onNavigateToCitation }: ChatPanelProps) {
     }
   }, [bookId, loadThreads]);
 
-  const activeThreadId = bookId ? getActiveThreadId(bookId) : null;
-  const activeThread = threads.find((t) => t.id === activeThreadId);
+  const storedActiveThreadId = bookId ? bookActiveThreadIds[bookId] || null : null;
   const bookThreads = bookId ? getThreadsForContext(bookId) : [];
-  const firstBookThreadId = bookThreads[0]?.id;
+  // Fall back to the newest thread of this book until one has been picked: the
+  // fallback rides along with the threads in the same render, so opening the
+  // panel shows the latest conversation instead of flashing the empty state.
+  const activeThreadId = storedActiveThreadId ?? bookThreads[0]?.id ?? null;
+  const activeThread = threads.find((t) => t.id === activeThreadId);
 
   useEffect(() => {
-    if (bookId && !activeThreadId && firstBookThreadId) {
-      setBookActiveThread(bookId, firstBookThreadId);
+    if (bookId && !storedActiveThreadId && activeThreadId) {
+      setBookActiveThread(bookId, activeThreadId);
     }
-  }, [activeThreadId, bookId, firstBookThreadId, setBookActiveThread]);
+  }, [activeThreadId, bookId, storedActiveThreadId, setBookActiveThread]);
 
   const [showThreadList, setShowThreadList] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
